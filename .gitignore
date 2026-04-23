@@ -1,1 +1,36 @@
+# .NET
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/packages/
+*.user
+*.suo
+*.sln.docstates
 
+# Logs
+logs/
+*.log
+
+# Reports (generated)
+reports/
+screenshots/
+
+# OS
+.DS_Store
+Thumbs.db
+.DS_Store?
+
+# NuGet
+*.nupkg
+# NuGet v3 cache
+http-pipeline-*.json
+nuget.cache
+
+# Publish
+publish/
+**/publish/
+
+# Rider
+.idea/
+*.sln.iml
