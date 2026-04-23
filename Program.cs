@@ -13,7 +13,7 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("🔍 WebRecon Enterprise v3.0 - Production");
+        Console.WriteLine("🔍 WebRecon Enterprise - Production");
         
         if (args.Length == 0)
         {
