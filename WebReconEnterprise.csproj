@@ -1,1 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>webrecon</ToolCommandName>
+    <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>WebReconEnterprise</PackageId>
+    <PackageVersion>1.0.0</PackageVersion>
+    <Authors>LaxenTgit</Authors>
+    <Description>Production-ready Web Reconnaissance Tool</Description>
+    <RepositoryUrl>https://github.com/LaxenTgit/WebReconEnterprise</RepositoryUrl>
+    <PackageTags>pentest;recon;security;dotnet</PackageTags>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Flurl.Http" Version="4.0.2" />
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.62" />
+    <PackageReference Include="AngleSharp" Version="1.1.2" />
+    <PackageReference Include="Polly" Version="8.0.0" />
+    <PackageReference Include="PuppeteerSharp" Version="13.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.4" />
+  </ItemGroup>
+
+</Project>
