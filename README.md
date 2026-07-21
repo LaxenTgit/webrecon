@@ -17,7 +17,7 @@ DNS, Port Scan, SSL Analysis, Tech Detection, Directory Brute Force, JS Parsing
 ## 🎬 Demo
 ![Demo](screenshots/demo.gif)
 
-## 🚀 Quick Start (2dk)
+## Quick Start
 ```bash
 # Kali/Debian/Ubuntu
 curl -sSL https://raw.githubusercontent.com/LaxenTgit/WebReconEnterprise/main/install.sh | bash
