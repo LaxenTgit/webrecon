@@ -1,20 +1,22 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.IO;
-using System.Text.Json;
 
 class Program
 {
     static async Task Main(string[] args)
     {
         Console.WriteLine("🔍 WebRecon Enterprise - Production");
-        
+
         if (args.Length == 0)
         {
             Console.WriteLine("Usage: dotnet run https://scanme.nmap.org");
@@ -31,7 +33,7 @@ class Program
         Console.WriteLine($"Target: {target}");
         Directory.CreateDirectory("reports");
 
-        var recon = new WebRecon(target);
+        using var recon = new WebRecon(target);
         var result = await recon.ScanAsync();
         await recon.GenerateReportsAsync(result);
 
@@ -42,7 +44,7 @@ class Program
     private static string NormalizeTarget(string input)
     {
         input = input.Trim().TrimEnd('/');
-        
+
         if (!input.StartsWith("http://") && !input.StartsWith("https://"))
             input = "https://" + input;
 
@@ -63,20 +65,25 @@ public class WebRecon : IDisposable
     private readonly HttpClient _httpClient;
     private readonly SemaphoreSlim _httpSemaphore;
     private readonly SemaphoreSlim _portSemaphore;
+    private readonly string _targetUrl;
     private bool _disposed;
 
     public WebRecon(string target)
     {
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        _httpSemaphore = new SemaphoreSlim(5, 5);  // HTTP rate limit
-        _portSemaphore = new SemaphoreSlim(50, 50); // Port scan concurrency
+        _targetUrl = target;
+        _httpClient = new HttpClient
+        {
+            BaseAddress = new Uri(target),
+            Timeout = TimeSpan.FromSeconds(12)
+        };
+        _httpSemaphore = new SemaphoreSlim(5, 5);   // HTTP rate limit
+        _portSemaphore = new SemaphoreSlim(50, 50); // Port scan blabla
     }
 
     public async Task<ScanResult> ScanAsync()
     {
-        var result = new ScanResult { Target = _httpClient.BaseAddress?.ToString() ?? "" };
+        var result = new ScanResult { Target = _targetUrl };
 
-        // SEPARATE SEMAPHORES - NO CONTENTION
         var tasks = new[]
         {
             ScanHeadersAsync(result),
@@ -86,7 +93,7 @@ public class WebRecon : IDisposable
         };
 
         await Task.WhenAll(tasks);
-        result.Risk = RiskCalculator.Calculate(result);  // STATIC - NO STATE CONFUSION
+        result.Risk = RiskCalculator.Calculate(result);
         return result;
     }
 
@@ -97,7 +104,7 @@ public class WebRecon : IDisposable
             await _httpSemaphore.WaitAsync();
             using var req = new HttpRequestMessage(HttpMethod.Head, result.Target);
             using var resp = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
-            
+
             result.Headers = resp.Headers
                 .ToDictionary(h => h.Key, h => string.Join(", ", h.Value), StringComparer.OrdinalIgnoreCase);
         }
@@ -123,10 +130,10 @@ public class WebRecon : IDisposable
             {
                 using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(800));
-                
+
                 var hostEntry = await Dns.GetHostEntryAsync(new Uri(result.Target).Host, cts.Token);
                 var connectTask = socket.ConnectAsync(hostEntry.AddressList[0], port);
-                
+
                 if (await Task.WhenAny(connectTask, Task.Delay(800, cts.Token)) == connectTask)
                 {
                     openPorts.Add(port);
@@ -156,14 +163,14 @@ public class WebRecon : IDisposable
                 await _httpSemaphore.WaitAsync();
                 var url = new Uri(new Uri(result.Target), dir).ToString();
                 using var resp = await _httpClient.GetAsync(url);
-                
+
                 if (resp.IsSuccessStatusCode || resp.StatusCode == HttpStatusCode.Forbidden)
                 {
-                    foundDirs.Add(new DirectoryInfo 
-                    { 
-                        Path = dir, 
+                    foundDirs.Add(new DirectoryInfo
+                    {
+                        Path = dir,
                         StatusCode = (int)resp.StatusCode,
-                        ContentLength = resp.Content.Headers.ContentLength ?? 0 
+                        ContentLength = resp.Content.Headers.ContentLength ?? 0
                     });
                     Console.WriteLine($"📁 {dir} ({resp.StatusCode})");
                 }
@@ -196,11 +203,14 @@ public class WebRecon : IDisposable
                 techs.Add("Apache");
 
             result.Technologies = techs;
-            _httpSemaphore.Release();
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Tech scan: {ex.Message}");
+        }
+        finally
+        {
+            _httpSemaphore.Release();
         }
     }
 
@@ -220,15 +230,13 @@ public class WebRecon : IDisposable
             risk_assessment = result.Risk
         };
 
-        // JSON Report
-        var json = JsonSerializer.Serialize(report, new JsonSerializerOptions 
-        { 
+        var json = JsonSerializer.Serialize(report, new JsonSerializerOptions
+        {
             WriteIndented = true,
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         });
         await File.WriteAllTextAsync("reports/report.json", json);
 
-        // HTML Report
         var htmlColor = result.Risk.Level switch
         {
             "HIGH" => "#f44336",
@@ -251,7 +259,7 @@ public class WebRecon : IDisposable
 </head>
 <body>
     <div class='header'>
-        <h1>🔍 WebRecon Enterprise v3.0</h1>
+        <h1>🔍 WRN</h1>
         <p><strong>{result.Target}</strong></p>
         <p class='risk'>{result.Risk.Level} Risk | {result.Risk.Score}/100</p>
     </div>
@@ -260,7 +268,7 @@ public class WebRecon : IDisposable
     
     {(result.Risk.Issues.Any() ? $"<div class='issues'><strong>Top Issues:</strong><ul>{string.Join("", result.Risk.Issues.Select(i => $"<li>{i}</li>"))}</ul></div>" : "")}
     
-    <small style='opacity: 0.6;'>Generated: {DateTime.Now} | LaxenTgit</small>
+    <small style='opacity: 0.6;'>Generated: {DateTime.Now}</small>
 </body>
 </html>";
 
@@ -301,8 +309,7 @@ public static class RiskCalculator
     public static RiskAssessment Calculate(ScanResult result)
     {
         var assessment = new RiskAssessment();
-        
-        // Port Analysis
+
         var highRiskPorts = result.Ports.Where(p => p is 21 or 22 or 23 or 3389).ToList();
         if (highRiskPorts.Any())
         {
@@ -310,20 +317,17 @@ public static class RiskCalculator
             assessment.Issues.AddRange(highRiskPorts.Select(p => $"CRITICAL: Port {p} exposed"));
         }
 
-        // Directory Exposure
         if (result.Directories.Any())
         {
             assessment.Score += result.Directories.Count * 10;
             assessment.Issues.Add($"{result.Directories.Count} directories accessible");
         }
 
-        // Security Headers
         if (!result.Headers.ContainsKey("strict-transport-security"))
             assessment.Issues.Add("Missing HSTS");
         if (!result.Headers.ContainsKey("x-frame-options"))
             assessment.Issues.Add("Missing X-Frame-Options");
 
-        // Tech Stack
         if (result.Technologies.Contains("WordPress"))
             assessment.Issues.Add("WordPress detected - verify plugins");
 
