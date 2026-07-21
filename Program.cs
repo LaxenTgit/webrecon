@@ -15,260 +15,248 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("🔍 WebRecon Enterprise - Production");
+        Console.WriteLine("=== Recon Tool v1.0 ===");
 
         if (args.Length == 0)
         {
-            Console.WriteLine("Usage: dotnet run https://scanme.nmap.org");
+            Console.WriteLine("Kullanım: dotnet run <target_url>");
             return;
         }
 
-        var target = NormalizeTarget(args[0]);
+        var target = FixUrl(args[0]);
         if (string.IsNullOrEmpty(target))
         {
-            Console.WriteLine("❌ Invalid target");
+            Console.WriteLine("[-] Geçersiz URL girildi.");
             return;
         }
 
-        Console.WriteLine($"Target: {target}");
-        Directory.CreateDirectory("reports");
+        Console.WriteLine($"[*] Hedef: {target}");
+        
+        if (!Directory.Exists("reports"))
+            Directory.CreateDirectory("reports");
 
-        using var recon = new WebRecon(target);
-        var result = await recon.ScanAsync();
-        await recon.GenerateReportsAsync(result);
+        using var scanner = new WebScanner(target);
+        var result = await scanner.RunAsync();
+        
+        await scanner.SaveReportsAsync(result);
 
-        Console.WriteLine($"✅ Complete | {result.Risk.Level} ({result.Risk.Score}/100)");
-        Console.WriteLine("📁 reports/report.json | report.html");
+        Console.WriteLine($"\n[+] Tarama bitti. Risk Seviyesi: {result.Risk.Level} ({result.Risk.Score}/100)");
+        Console.WriteLine("[+] Raporlar 'reports' klasörüne kaydedildi.");
     }
 
-    private static string NormalizeTarget(string input)
+    private static string FixUrl(string input)
     {
+        if (string.IsNullOrWhiteSpace(input)) return null;
+        
         input = input.Trim().TrimEnd('/');
-
         if (!input.StartsWith("http://") && !input.StartsWith("https://"))
+        {
             input = "https://" + input;
+        }
 
-        try
-        {
-            var uri = new Uri(input);
-            return uri.ToString();
-        }
-        catch
-        {
-            return null;
-        }
+        return Uri.TryCreate(input, UriKind.Absolute, out var uri) ? uri.ToString() : null;
     }
 }
 
-public class WebRecon : IDisposable
+public class WebScanner : IDisposable
 {
-    private readonly HttpClient _httpClient;
-    private readonly SemaphoreSlim _httpSemaphore;
-    private readonly SemaphoreSlim _portSemaphore;
-    private readonly string _targetUrl;
-    private bool _disposed;
+    private readonly HttpClient _client;
+    private readonly SemaphoreSlim _httpLimiter = new(5, 5);
+    private readonly SemaphoreSlim _portLimiter = new(50, 50);
+    private readonly string _target;
 
-    public WebRecon(string target)
+    public WebScanner(string target)
     {
-        _targetUrl = target;
-        _httpClient = new HttpClient
+        _target = target;
+        _client = new HttpClient
         {
             BaseAddress = new Uri(target),
-            Timeout = TimeSpan.FromSeconds(12)
+            Timeout = TimeSpan.FromSeconds(10)
         };
-        _httpSemaphore = new SemaphoreSlim(5, 5);   // HTTP rate limit
-        _portSemaphore = new SemaphoreSlim(50, 50); // Port scan blabla
+        
+        // Sunucu engeline takılmamak için varsayılan User-Agent
+        _client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
     }
 
-    public async Task<ScanResult> ScanAsync()
+    public async Task<ScanResult> RunAsync()
     {
-        var result = new ScanResult { Target = _targetUrl };
+        var result = new ScanResult { Target = _target };
 
-        var tasks = new[]
+        // paraler çalışma
+        var tasks = new Task[]
         {
-            ScanHeadersAsync(result),
+            CheckHeadersAsync(result),
             ScanPortsAsync(result),
-            ScanDirectoriesAsync(result),
-            ScanTechnologiesAsync(result)
+            CheckDirectoriesAsync(result),
+            DetectTechAsync(result)
         };
 
         await Task.WhenAll(tasks);
-        result.Risk = RiskCalculator.Calculate(result);
+        
+        result.Risk = RiskCalculator.Evaluate(result);
         return result;
     }
 
-    private async Task ScanHeadersAsync(ScanResult result)
+    private async Task CheckHeadersAsync(ScanResult result)
     {
+        await _httpLimiter.WaitAsync();
         try
         {
-            await _httpSemaphore.WaitAsync();
-            using var req = new HttpRequestMessage(HttpMethod.Head, result.Target);
-            using var resp = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            using var req = new HttpRequestMessage(HttpMethod.Head, _target);
+            using var res = await _client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
 
-            result.Headers = resp.Headers
-                .ToDictionary(h => h.Key, h => string.Join(", ", h.Value), StringComparer.OrdinalIgnoreCase);
+            foreach (var header in res.Headers)
+            {
+                result.Headers[header.Key] = string.Join(", ", header.Value);
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Headers: {ex.Message}");
+            Console.WriteLine($"[!] Header tarama hatası: {ex.Message}");
         }
         finally
         {
-            _httpSemaphore.Release();
+            _httpLimiter.Release();
         }
     }
 
     private async Task ScanPortsAsync(ScanResult result)
     {
-        var ports = new[] { 21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443 };
-        var openPorts = new ConcurrentBag<int>();
+        // common servis portları
+        int[] targetPorts = { 21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443 };
+        var foundPorts = new ConcurrentBag<int>();
 
-        var tasks = ports.Select(async port =>
+        var tasks = targetPorts.Select(async port =>
         {
-            await _portSemaphore.WaitAsync();
+            await _portLimiter.WaitAsync();
             try
             {
                 using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(800));
+                using var cts = new CancellationTokenSource(1000); // 1 sn timeout
 
-                var hostEntry = await Dns.GetHostEntryAsync(new Uri(result.Target).Host, cts.Token);
-                var connectTask = socket.ConnectAsync(hostEntry.AddressList[0], port);
+                var host = new Uri(_target).Host;
+                var ipList = await Dns.GetHostAddressesAsync(host, cts.Token);
+                
+                if (ipList.Length == 0) return;
 
-                if (await Task.WhenAny(connectTask, Task.Delay(800, cts.Token)) == connectTask)
+                var connectTask = socket.ConnectAsync(ipList[0], port);
+                if (await Task.WhenAny(connectTask, Task.Delay(1000, cts.Token)) == connectTask && socket.Connected)
                 {
-                    openPorts.Add(port);
-                    Console.WriteLine($"✅ Port {port} OPEN");
+                    foundPorts.Add(port);
+                    Console.WriteLine($"  [+] Port {port} Açık");
                 }
             }
-            catch { }
+            catch
+            {
+                // Bağlantı reddedildi
+            }
             finally
             {
-                _portSemaphore.Release();
+                _portLimiter.Release();
             }
         });
 
         await Task.WhenAll(tasks);
-        result.Ports = openPorts.OrderBy(p => p).ToList();
+        result.Ports = foundPorts.OrderBy(p => p).ToList();
     }
 
-    private async Task ScanDirectoriesAsync(ScanResult result)
+    private async Task CheckDirectoriesAsync(ScanResult result)
     {
-        var dirs = new[] { "admin/", "administrator/", "api/", "login/", "wp-admin/", "config/", "backup/" };
-        var foundDirs = new ConcurrentBag<DirectoryInfo>();
+        string[] commonPaths = { "admin/", "administrator/", "api/", "login/", "wp-admin/", "config/", "backup/" };
+        var list = new ConcurrentBag<PathInfo>();
 
-        var tasks = dirs.Select(async dir =>
+        var tasks = commonPaths.Select(async path =>
         {
+            await _httpLimiter.WaitAsync();
             try
             {
-                await _httpSemaphore.WaitAsync();
-                var url = new Uri(new Uri(result.Target), dir).ToString();
-                using var resp = await _httpClient.GetAsync(url);
+                var fullUrl = new Uri(new Uri(_target), path).ToString();
+                using var res = await _client.GetAsync(fullUrl);
 
-                if (resp.IsSuccessStatusCode || resp.StatusCode == HttpStatusCode.Forbidden)
+                if (res.IsSuccessStatusCode || res.StatusCode == HttpStatusCode.Forbidden)
                 {
-                    foundDirs.Add(new DirectoryInfo
+                    list.Add(new PathInfo
                     {
-                        Path = dir,
-                        StatusCode = (int)resp.StatusCode,
-                        ContentLength = resp.Content.Headers.ContentLength ?? 0
+                        Path = path,
+                        StatusCode = (int)res.StatusCode,
+                        Size = res.Content.Headers.ContentLength ?? 0
                     });
-                    Console.WriteLine($"📁 {dir} ({resp.StatusCode})");
+                    Console.WriteLine($"  [+] Bulundu: /{path} (HTTP {(int)res.StatusCode})");
                 }
             }
-            catch { }
+            catch
+            {
+                // istek haatası
+            }
             finally
             {
-                _httpSemaphore.Release();
+                _httpLimiter.Release();
             }
         });
 
         await Task.WhenAll(tasks);
-        result.Directories = foundDirs.ToList();
+        result.Directories = list.ToList();
     }
 
-    private async Task ScanTechnologiesAsync(ScanResult result)
+    private async Task DetectTechAsync(ScanResult result)
     {
+        await _httpLimiter.WaitAsync();
         try
         {
-            await _httpSemaphore.WaitAsync();
-            using var resp = await _httpClient.GetAsync(result.Target);
-            var html = await resp.Content.ReadAsStringAsync();
+            using var res = await _client.GetAsync(_target);
+            var html = await res.Content.ReadAsStringAsync();
 
-            var techs = new List<string>();
-            if (Regex.IsMatch(html, @"wp-content|wp-includes|wp-json", RegexOptions.IgnoreCase))
-                techs.Add("WordPress");
+            var detected = new List<string>();
+
+            if (Regex.IsMatch(html, @"wp-content|wp-includes", RegexOptions.IgnoreCase))
+                detected.Add("WordPress");
             if (Regex.IsMatch(html, @"nginx", RegexOptions.IgnoreCase))
-                techs.Add("Nginx");
+                detected.Add("Nginx");
             if (Regex.IsMatch(html, @"apache", RegexOptions.IgnoreCase))
-                techs.Add("Apache");
+                detected.Add("Apache");
 
-            result.Technologies = techs;
+            result.Technologies = detected;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Tech scan: {ex.Message}");
+            Console.WriteLine($"[!] Teknoloji tespiti hatası: {ex.Message}");
         }
         finally
         {
-            _httpSemaphore.Release();
+            _httpLimiter.Release();
         }
     }
 
-    public async Task GenerateReportsAsync(ScanResult result)
+    public async Task SaveReportsAsync(ScanResult result)
     {
-        var report = new
-        {
-            target = result.Target,
-            timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
-            modules = new
-            {
-                headers = result.Headers,
-                ports = result.Ports,
-                directories = result.Directories,
-                technologies = result.Technologies
-            },
-            risk_assessment = result.Risk
-        };
-
-        var json = JsonSerializer.Serialize(report, new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
+        var options = new JsonSerializerOptions { WriteIndented = true };
+        var json = JsonSerializer.Serialize(result, options);
+        
         await File.WriteAllTextAsync("reports/report.json", json);
 
-        var htmlColor = result.Risk.Level switch
-        {
-            "HIGH" => "#f44336",
-            "MEDIUM" => "#ff9800",
-            _ => "#4caf50"
-        };
-
         var html = $@"<!DOCTYPE html>
-<html>
+<html lang='tr'>
 <head>
-    <title>WebRecon v3.0 - {result.Target}</title>
+    <meta charset='UTF-8'>
+    <title>Tarama Raporu - {result.Target}</title>
     <style>
-        body {{ font-family: 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; line-height: 1.6; }}
-        .header {{ background: #21262d; padding: 1.5rem; border-radius: 8px; margin-bottom: 2rem; }}
-        .risk {{ color: {htmlColor}; font-weight: bold; font-size: 1.2em; }}
-        pre {{ background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; }}
-        h1 {{ color: #58a6ff; margin-top: 0; }}
-        .issues {{ background: #1f2937; padding: 1rem; border-left: 4px solid {htmlColor}; }}
+        body {{ font-family: sans-serif; margin: 20px; background: #f4f4f9; color: #333; }}
+        .card {{ background: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+        pre {{ background: #272822; color: #f8f8f2; padding: 15px; border-radius: 5px; overflow-x: auto; }}
+        .badge {{ padding: 5px 10px; border-radius: 3px; color: #fff; font-weight: bold; }}
+        .HIGH {{ background: #e74c3c; }}
+        .MEDIUM {{ background: #f39c12; }}
+        .LOW {{ background: #2ecc71; }}
     </style>
 </head>
 <body>
-    <div class='header'>
-        <h1>🔍 WRN</h1>
-        <p><strong>{result.Target}</strong></p>
-        <p class='risk'>{result.Risk.Level} Risk | {result.Risk.Score}/100</p>
+    <div class='card'>
+        <h2>Tarama Özeti: {result.Target}</h2>
+        <p>Risk Durumu: <span class='badge {result.Risk.Level}'>{result.Risk.Level} ({result.Risk.Score}/100)</span></p>
+        <hr>
+        <h3>Bulgular (JSON)</h3>
+        <pre>{json}</pre>
     </div>
-    
-    <pre>{json}</pre>
-    
-    {(result.Risk.Issues.Any() ? $"<div class='issues'><strong>Top Issues:</strong><ul>{string.Join("", result.Risk.Issues.Select(i => $"<li>{i}</li>"))}</ul></div>" : "")}
-    
-    <small style='opacity: 0.6;'>Generated: {DateTime.Now}</small>
 </body>
 </html>";
 
@@ -277,13 +265,9 @@ public class WebRecon : IDisposable
 
     public void Dispose()
     {
-        if (!_disposed)
-        {
-            _httpClient?.Dispose();
-            _httpSemaphore?.Dispose();
-            _portSemaphore?.Dispose();
-            _disposed = true;
-        }
+        _client?.Dispose();
+        _httpLimiter?.Dispose();
+        _portLimiter?.Dispose();
     }
 }
 
@@ -292,60 +276,58 @@ public class ScanResult
     public string Target { get; set; } = "";
     public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<int> Ports { get; set; } = new();
-    public List<DirectoryInfo> Directories { get; set; } = new();
+    public List<PathInfo> Directories { get; set; } = new();
     public List<string> Technologies { get; set; } = new();
-    public RiskAssessment Risk { get; set; } = new();
+    public RiskInfo Risk { get; set; } = new();
 }
 
-public class DirectoryInfo
+public class PathInfo
 {
     public string Path { get; set; } = "";
     public int StatusCode { get; set; }
-    public long ContentLength { get; set; }
+    public long Size { get; set; }
+}
+
+public class RiskInfo
+{
+    public int Score { get; set; }
+    public string Level { get; set; } = "LOW";
+    public List<string> Findings { get; set; } = new();
 }
 
 public static class RiskCalculator
 {
-    public static RiskAssessment Calculate(ScanResult result)
+    public static RiskInfo Evaluate(ScanResult scan)
     {
-        var assessment = new RiskAssessment();
+        var risk = new RiskInfo();
 
-        var highRiskPorts = result.Ports.Where(p => p is 21 or 22 or 23 or 3389).ToList();
-        if (highRiskPorts.Any())
+        // Hasas port 
+        var openCriticalPorts = scan.Ports.Where(p => p is 21 or 22 or 23 or 3389).ToList();
+        if (openCriticalPorts.Count > 0)
         {
-            assessment.Score += highRiskPorts.Count * 20;
-            assessment.Issues.AddRange(highRiskPorts.Select(p => $"CRITICAL: Port {p} exposed"));
+            risk.Score += openCriticalPorts.Count * 20;
+            risk.Findings.Add($"Açık kritik portlar: {string.Join(", ", openCriticalPorts)}");
         }
 
-        if (result.Directories.Any())
+        // Acık dizinler
+        if (scan.Directories.Count > 0)
         {
-            assessment.Score += result.Directories.Count * 10;
-            assessment.Issues.Add($"{result.Directories.Count} directories accessible");
+            risk.Score += scan.Directories.Count * 10;
+            risk.Findings.Add($"{scan.Directories.Count} adet hassas/erişilebilir dizin bulundu.");
         }
 
-        if (!result.Headers.ContainsKey("strict-transport-security"))
-            assessment.Issues.Add("Missing HSTS");
-        if (!result.Headers.ContainsKey("x-frame-options"))
-            assessment.Issues.Add("Missing X-Frame-Options");
+        // Header -
+        if (!scan.Headers.ContainsKey("Strict-Transport-Security"))
+            risk.Findings.Add("HSTS başlığı eksik.");
 
-        if (result.Technologies.Contains("WordPress"))
-            assessment.Issues.Add("WordPress detected - verify plugins");
-
-        assessment.Score = Math.Min(assessment.Score, 100);
-        assessment.Level = assessment.Score switch
+        risk.Score = Math.Min(risk.Score, 100);
+        risk.Level = risk.Score switch
         {
-            < 30 => "LOW",
-            < 70 => "MEDIUM",
-            _ => "HIGH"
+            >= 70 => "HIGH",
+            >= 30 => "MEDIUM",
+            _ => "LOW"
         };
 
-        return assessment;
+        return risk;
     }
-}
-
-public class RiskAssessment
-{
-    public int Score { get; set; }
-    public string Level { get; set; } = "LOW";
-    public List<string> Issues { get; set; } = new();
 }
